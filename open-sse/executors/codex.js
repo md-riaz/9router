@@ -3,6 +3,35 @@ import { CODEX_DEFAULT_INSTRUCTIONS } from "../config/codexInstructions.js";
 import { PROVIDERS } from "../config/providers.js";
 import { normalizeResponsesInput } from "../translator/helpers/responsesApiHelper.js";
 
+// ─── Codex Scope-Aware Quota Pooling ─────────────────────────────────────────
+// Codex has two independent quota pools: "codex" (standard) and "spark" (premium).
+// Exhausting one pool must NOT block requests that target the other pool.
+// Scope is determined by substring matching on the model name.
+// Ref: OmniRoute T09 — codex vs spark independent rate-limit buckets.
+
+const CODEX_SCOPE_PATTERNS = [
+  { pattern: "codex-spark", scope: "spark" },
+  { pattern: "spark",       scope: "spark" },
+  { pattern: "codex",       scope: "codex" },
+  { pattern: "gpt-5",       scope: "codex" }, // gpt-5.x variants share the codex pool
+];
+
+/**
+ * Map a Codex model name to its quota scope ("codex" or "spark").
+ * Use this scope as the key for per-account scope rate-limit state so that
+ * a 429 on one scope does not block requests to the other.
+ *
+ * @param {string} model - Codex model ID (e.g. "gpt-5.3-codex", "gpt-5.3-codex-spark")
+ * @returns {"codex"|"spark"}
+ */
+export function getCodexModelScope(model) {
+  const lower = (model || "").toLowerCase();
+  for (const { pattern, scope } of CODEX_SCOPE_PATTERNS) {
+    if (lower.includes(pattern)) return scope;
+  }
+  return "codex"; // default scope
+}
+
 /**
  * Codex Executor - handles OpenAI Codex API (Responses API format)
  * Automatically injects default instructions if missing

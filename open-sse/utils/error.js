@@ -108,10 +108,12 @@ export function msUntilNextMidnightUTC() {
  * Handles:
  *   - Structured JSON fields: reset_at, quota_resets_at, resets_at, retry_after (ISO or Unix)
  *   - ISO-8601 timestamp anywhere in error message text
- *   - "midnight UTC" / "tomorrow" phrasing → next midnight UTC
  *   - "resets on YYYY-MM-DD" date patterns
- *   - error code "daily_limit_exceeded" → next midnight UTC
- *   - error code "weekly_limit_exceeded" / "weekly" in message → 7 days
+ *   - error code "session_limit_exceeded" / "five_hour" / "5h" → 5 hours from now
+ *   - error code "weekly_limit_exceeded" / "7d" → 7 days
+ *   - "midnight UTC" / "tomorrow" phrases → next midnight UTC (for other providers with daily limits)
+ *   - "weekly limit" keyword → 7 days
+ *   NOTE: Codex has a 5h session window and a 7d weekly window — NOT a daily limit.
  *
  * @param {object|null} json - Parsed JSON body (may be null if body wasn't JSON)
  * @param {string} message - Error message string
@@ -151,27 +153,30 @@ export function parseCodexQuotaResetMs(json, message) {
   }
 
   const msg = typeof message === "string" ? message : "";
-  if (!msg) return null;
-
-  // 3. Check error code for daily / weekly limits
   const errorCode = json?.error?.code || json?.code || "";
 
+  // 3. Codex session (5h) limit error codes
   if (
-    errorCode === "daily_limit_exceeded" ||
-    /daily[_ ]limit[_ ]exceeded/i.test(errorCode)
+    /session[_\s]limit[_\s]exceeded/i.test(errorCode) ||
+    /five[_\s]hour/i.test(errorCode) ||
+    errorCode === "5h_limit_exceeded"
   ) {
-    return msUntilNextMidnightUTC();
+    return 5 * 60 * 60 * 1000;
   }
 
+  // 4. Weekly (7d) limit error codes
   if (
     errorCode === "weekly_limit_exceeded" ||
-    /weekly[_ ]limit[_ ]exceeded/i.test(errorCode)
+    /weekly[_ ]limit[_ ]exceeded/i.test(errorCode) ||
+    /seven[_\s]day/i.test(errorCode) ||
+    errorCode === "7d_limit_exceeded"
   ) {
     return 7 * 24 * 60 * 60 * 1000;
   }
 
-  // 4. ISO-8601 timestamp in the message text
-  // Matches patterns like "2024-01-16T00:00:00Z", "2024-01-16T00:00:00.000Z"
+  if (!msg) return null;
+
+  // 5. ISO-8601 timestamp in the message text
   const isoMatch = msg.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/);
   if (isoMatch) {
     const t = new Date(isoMatch[0]).getTime();
@@ -181,10 +186,9 @@ export function parseCodexQuotaResetMs(json, message) {
     }
   }
 
-  // 5. "resets on YYYY-MM-DD" or "resets at YYYY-MM-DD" date in message
+  // 6. "resets on YYYY-MM-DD" or "resets at YYYY-MM-DD" date in message
   const dateMatch = msg.match(/resets?\s+(?:on|at)\s+(\d{4}-\d{2}-\d{2})/i);
   if (dateMatch) {
-    // Treat as UTC midnight on that date
     const t = new Date(dateMatch[1] + "T00:00:00Z").getTime();
     if (!isNaN(t)) {
       const diff = t - Date.now();
@@ -192,17 +196,17 @@ export function parseCodexQuotaResetMs(json, message) {
     }
   }
 
-  // 6. "midnight UTC" or "tomorrow" phrasing → next midnight UTC
+  // 7. "session" / "5h" / "5-hour" limit keyword in message → 5h from now (Codex)
+  if (/\b5[\s-]?h(?:our)?\b|\bsession\s+(?:quota|limit)\b|\bfive[\s-]hour\b/i.test(msg)) {
+    return 5 * 60 * 60 * 1000;
+  }
+
+  // 8. "midnight UTC" or "tomorrow" phrasing → next midnight UTC (other providers with daily limits)
   if (/midnight\s+UTC/i.test(msg) || /\btomorrow\b/i.test(msg)) {
     return msUntilNextMidnightUTC();
   }
 
-  // 7. "daily limit" keyword with no better info → next midnight UTC
-  if (/\bdaily\b.*\blimit\b|\blimit\b.*\bdaily\b/i.test(msg)) {
-    return msUntilNextMidnightUTC();
-  }
-
-  // 8. "weekly limit" keyword with no better info → 7 days
+  // 9. "weekly limit" keyword in message → 7 days
   if (/\bweekly\b.*\blimit\b|\blimit\b.*\bweekly\b/i.test(msg)) {
     return 7 * 24 * 60 * 60 * 1000;
   }
@@ -306,13 +310,32 @@ export async function parseUpstreamError(response, provider = null) {
       }
     }
 
-    // 4. Structured JSON body and quota message parsing
-    //    Handles Codex daily/weekly limits, ISO dates in error text, "midnight UTC", etc.
+    // 4. Codex-specific quota window headers (present on every Codex response).
+    //    x-codex-7d-reset-at  — ISO timestamp of weekly window reset
+    //    x-codex-5h-reset-at  — ISO timestamp of 5h session window reset
+    //    Per OmniRoute T03: use the furthest-out reset time to avoid premature unblock.
+    if (!retryAfterMs) {
+      const reset7d = response.headers?.get?.("x-codex-7d-reset-at");
+      const reset5h = response.headers?.get?.("x-codex-5h-reset-at");
+      const candidates = [];
+      for (const h of [reset7d, reset5h]) {
+        if (!h) continue;
+        const t = new Date(h).getTime();
+        if (!isNaN(t) && t > Date.now()) candidates.push(t - Date.now());
+      }
+      if (candidates.length > 0) {
+        // Use furthest-out reset so the lock is not released before the longer window expires
+        retryAfterMs = Math.max(...candidates);
+      }
+    }
+
+    // 5. Structured JSON body and quota message parsing
+    //    Handles Codex 5h/weekly limits, ISO dates in error text, etc.
     if (!retryAfterMs) {
       retryAfterMs = parseCodexQuotaResetMs(parsedJson, finalMessage);
     }
 
-    // 5. Antigravity "reset after Xh Ym Zs" text pattern (legacy fallback)
+    // 6. Antigravity "reset after Xh Ym Zs" text pattern (legacy fallback)
     if (!retryAfterMs) {
       retryAfterMs = parseAntigravityRetryTime(finalMessage);
     }
