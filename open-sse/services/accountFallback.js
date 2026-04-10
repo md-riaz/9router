@@ -185,10 +185,18 @@ export function getEarliestModelLockUntil(connection) {
 
 /**
  * Build update object to set a model lock on a connection.
+ * @param {string|null} model - Model name (null = account-level lock)
+ * @param {number} cooldownMs - Fallback cooldown duration in ms (used when retryAfterMs is absent)
+ * @param {number|null} [retryAfterMs] - Provider-specified ms until reset (e.g. from Retry-After header).
+ *   When provided and greater than the computed cooldown, this value is used as-is so the lock
+ *   persists until the actual quota/rate-limit window expires.
  */
-export function buildModelLockUpdate(model, cooldownMs) {
+export function buildModelLockUpdate(model, cooldownMs, retryAfterMs = null) {
   const key = getModelLockKey(model);
-  return { [key]: new Date(Date.now() + cooldownMs).toISOString() };
+  // Use provider-specified reset time when available and longer than the computed backoff.
+  // This prevents wasting retries before the actual quota window expires.
+  const lockMs = (retryAfterMs != null && retryAfterMs > cooldownMs) ? retryAfterMs : cooldownMs;
+  return { [key]: new Date(Date.now() + lockMs).toISOString() };
 }
 
 /**

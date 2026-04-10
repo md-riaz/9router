@@ -86,18 +86,60 @@ export function parseAntigravityRetryTime(message) {
 }
 
 /**
+ * Parse standard Retry-After header value into milliseconds.
+ * Supports both delay-seconds (integer) and HTTP-date formats per RFC 7231.
+ * @param {string|null} headerValue - Raw Retry-After header value
+ * @returns {number|null} Milliseconds until retry, or null if not parseable
+ */
+export function parseRetryAfterHeader(headerValue) {
+  if (!headerValue) return null;
+
+  // Try as delay-seconds (integer)
+  const delaySeconds = parseInt(headerValue, 10);
+  if (!isNaN(delaySeconds) && delaySeconds > 0) {
+    return delaySeconds * 1000;
+  }
+
+  // Try as HTTP-date
+  const date = new Date(headerValue);
+  if (!isNaN(date.getTime())) {
+    const diff = date.getTime() - Date.now();
+    return diff > 0 ? diff : null;
+  }
+
+  return null;
+}
+
+/**
+ * Parse x-ratelimit-reset header (Unix timestamp in seconds) into milliseconds from now.
+ * @param {string|null} headerValue - Raw x-ratelimit-reset header value
+ * @returns {number|null} Milliseconds until reset, or null if not parseable
+ */
+export function parseRateLimitResetHeader(headerValue) {
+  if (!headerValue) return null;
+
+  const resetUnix = parseInt(headerValue, 10);
+  if (isNaN(resetUnix) || resetUnix <= 0) return null;
+
+  // Determine if it's seconds or milliseconds (Unix epoch in seconds is ~10 digits)
+  const resetMs = resetUnix < 1e12 ? resetUnix * 1000 : resetUnix;
+  const diff = resetMs - Date.now();
+  return diff > 0 ? diff : null;
+}
+
+/**
  * Parse upstream provider error response
  * @param {Response} response - Fetch response from provider
- * @param {string} provider - Provider name (for Antigravity-specific parsing)
+ * @param {string} provider - Provider name (for provider-specific parsing)
  * @returns {Promise<{statusCode: number, message: string, retryAfterMs: number|null}>}
  */
 export async function parseUpstreamError(response, provider = null) {
   let message = "";
   let retryAfterMs = null;
-  
+
   try {
     const text = await response.text();
-    
+
     // Try parse as JSON
     try {
       const json = JSON.parse(text);
@@ -112,9 +154,36 @@ export async function parseUpstreamError(response, provider = null) {
   const messageStr = typeof message === "string" ? message : JSON.stringify(message);
   const finalMessage = messageStr || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
 
-  // Parse Antigravity-specific retry time from error message
-  if (provider === "antigravity" && response.status === 429) {
-    retryAfterMs = parseAntigravityRetryTime(finalMessage);
+  // Only attempt to extract reset time for errors that indicate rate limiting or quota exhaustion
+  if (response.status === 429 || response.status === 403 || response.status === 402) {
+    // 1. Standard Retry-After header (RFC 7231) — takes highest priority
+    const retryAfterHeader = response.headers?.get?.("retry-after") ||
+      response.headers?.get?.("Retry-After");
+    retryAfterMs = parseRetryAfterHeader(retryAfterHeader);
+
+    // 2. x-ratelimit-reset header (Unix timestamp in seconds, used by GitHub and others)
+    if (!retryAfterMs) {
+      const resetHeader = response.headers?.get?.("x-ratelimit-reset") ||
+        response.headers?.get?.("x-ratelimit-reset-requests") ||
+        response.headers?.get?.("ratelimit-reset");
+      retryAfterMs = parseRateLimitResetHeader(resetHeader);
+    }
+
+    // 3. x-ratelimit-reset-after header (seconds, used by some providers)
+    if (!retryAfterMs) {
+      const resetAfterHeader = response.headers?.get?.("x-ratelimit-reset-after");
+      if (resetAfterHeader) {
+        const seconds = parseFloat(resetAfterHeader);
+        if (!isNaN(seconds) && seconds > 0) {
+          retryAfterMs = Math.ceil(seconds * 1000);
+        }
+      }
+    }
+
+    // 4. Provider-specific error message parsing (e.g. Antigravity "reset after Xh Ym Zs")
+    if (!retryAfterMs) {
+      retryAfterMs = parseAntigravityRetryTime(finalMessage);
+    }
   }
 
   return {

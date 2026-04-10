@@ -166,9 +166,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
+ * @param {number|null} [retryAfterMs] - Provider-specified ms until reset (from Retry-After header etc.)
+ *   When provided and exceeds the computed backoff, the lock is set to this exact duration so the
+ *   account+model is not retried before the provider's actual quota window expires.
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, retryAfterMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
@@ -178,7 +181,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(model, cooldownMs);
+  const lockUpdate = buildModelLockUpdate(model, cooldownMs, retryAfterMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -191,7 +194,8 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
-  log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
+  const effectiveLockMs = (retryAfterMs != null && retryAfterMs > cooldownMs) ? retryAfterMs : cooldownMs;
+  log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(effectiveLockMs / 1000)}s [${status}]${retryAfterMs && retryAfterMs > cooldownMs ? " (provider reset time)" : ""}`);
 
   if (provider && status && reason) {
     console.error(`❌ ${provider} [${status}]: ${reason}`);
