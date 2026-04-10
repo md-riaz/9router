@@ -211,6 +211,37 @@ export function buildClearModelLocksUpdate(connection) {
 }
 
 /**
+ * Providers where each model has an independent quota pool.
+ *
+ * A 429 or 404 on one model must NOT affect the connection's global backoff
+ * level or testStatus — only the specific model should be locked so that
+ * other models on the same account remain selectable.
+ *
+ * - antigravity: each model routes to a different backend (Gemini/Claude/OpenAI)
+ * - gemini:      Google AI Studio enforces per-model RPM and RPD quotas
+ * - openrouter:  500+ models with independent per-model rate limits
+ *
+ * Ref: OmniRoute hasPerModelQuota (gemini + passthrough providers)
+ */
+export const PER_MODEL_QUOTA_PROVIDERS = new Set([
+  "antigravity",
+  "gemini",
+  "openrouter",
+]);
+
+/**
+ * Returns true if the provider uses per-model independent quotas.
+ * For these providers, a 429/404 on one model should only lock that model,
+ * not the whole connection (testStatus/backoffLevel stay untouched).
+ * @param {string|null} provider
+ * @returns {boolean}
+ */
+export function hasPerModelQuota(provider) {
+  if (!provider) return false;
+  return PER_MODEL_QUOTA_PROVIDERS.has(provider);
+}
+
+/**
  * Filter available accounts (not in cooldown)
  */
 export function filterAvailableAccounts(accounts, excludeId = null) {

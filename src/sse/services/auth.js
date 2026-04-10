@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, hasPerModelQuota } from "open-sse/services/accountFallback.js";
 import { getCodexModelScope } from "open-sse/executors/codex.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
@@ -245,6 +245,37 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
   const effectiveLockMs = (retryAfterMs != null && retryAfterMs > cooldownMs) ? retryAfterMs : cooldownMs;
+
+  // ── Per-model quota providers: antigravity, gemini, openrouter ─────────────
+  // These providers have independent quotas per model. A 429/404 on one model
+  // must NOT mark the connection unavailable or increment the backoff level —
+  // other models on the same account may still have quota available.
+  // Connection testStatus/backoffLevel are intentionally left untouched.
+  if (hasPerModelQuota(provider) && model && (status === 429 || status === 404)) {
+    // Use backoffLevel=0: each model's quota is independent; no cross-model backoff.
+    const { cooldownMs: modelCooldownMs } = checkFallbackError(status, errorText, 0);
+    const modelEffectiveLockMs = (retryAfterMs != null && retryAfterMs > modelCooldownMs) ? retryAfterMs : modelCooldownMs;
+    const lockUpdate = buildModelLockUpdate(model, modelCooldownMs, retryAfterMs);
+    const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
+
+    await updateProviderConnection(connectionId, {
+      ...lockUpdate,
+      // Only update observability fields — connection stays active for other models
+      lastError: reason,
+      errorCode: status,
+      lastErrorAt: new Date().toISOString(),
+    });
+
+    const lockKey = Object.keys(lockUpdate)[0];
+    log.info("AUTH", `${connName} model-only lock ${lockKey} for ${Math.round(modelEffectiveLockMs / 1000)}s [${status}] — connection stays active for other models${retryAfterMs && retryAfterMs > modelCooldownMs ? " (provider reset time)" : ""}`);
+
+    if (provider && status && reason) {
+      console.error(`❌ ${provider} [${status}] (model-only): ${reason}`);
+    }
+
+    return { shouldFallback: true, cooldownMs: modelEffectiveLockMs };
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   // T09: Codex per-scope lockout (5h session + weekly quota pools are independent).
   // When a Codex account hits a 429, we lock the ENTIRE quota scope (all models that
