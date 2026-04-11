@@ -155,7 +155,9 @@ export function parseCodexQuotaResetMs(json, message) {
   const msg = typeof message === "string" ? message : "";
   const errorCode = json?.error?.code || json?.code || "";
 
-  // 3. Codex session (5h) limit error codes
+  // 3. Codex session (5h) limit error codes.
+  // "5h_limit_exceeded" is returned directly by chatgpt.com/api/auth/openai
+  // when the rolling 5-hour Codex session pool is exhausted.
   if (
     /session[_\s]limit[_\s]exceeded/i.test(errorCode) ||
     /five[_\s]hour/i.test(errorCode) ||
