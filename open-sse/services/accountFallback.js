@@ -185,10 +185,18 @@ export function getEarliestModelLockUntil(connection) {
 
 /**
  * Build update object to set a model lock on a connection.
+ * @param {string|null} model - Model name (null = account-level lock)
+ * @param {number} cooldownMs - Fallback cooldown duration in ms (used when retryAfterMs is absent)
+ * @param {number|null} [retryAfterMs] - Provider-specified ms until reset (e.g. from Retry-After header).
+ *   When provided and greater than the computed cooldown, this value is used as-is so the lock
+ *   persists until the actual quota/rate-limit window expires.
  */
-export function buildModelLockUpdate(model, cooldownMs) {
+export function buildModelLockUpdate(model, cooldownMs, retryAfterMs = null) {
   const key = getModelLockKey(model);
-  return { [key]: new Date(Date.now() + cooldownMs).toISOString() };
+  // Use provider-specified reset time when available and longer than the computed backoff.
+  // This prevents wasting retries before the actual quota window expires.
+  const lockMs = (retryAfterMs != null && retryAfterMs > cooldownMs) ? retryAfterMs : cooldownMs;
+  return { [key]: new Date(Date.now() + lockMs).toISOString() };
 }
 
 /**
@@ -200,6 +208,37 @@ export function buildClearModelLocksUpdate(connection) {
     if (key.startsWith(MODEL_LOCK_PREFIX)) cleared[key] = null;
   }
   return cleared;
+}
+
+/**
+ * Providers where each model has an independent quota pool.
+ *
+ * A 429 or 404 on one model must NOT affect the connection's global backoff
+ * level or testStatus — only the specific model should be locked so that
+ * other models on the same account remain selectable.
+ *
+ * - antigravity: each model routes to a different backend (Gemini/Claude/OpenAI)
+ * - gemini:      Google AI Studio enforces per-model RPM and RPD quotas
+ * - openrouter:  500+ models with independent per-model rate limits
+ *
+ * Ref: OmniRoute hasPerModelQuota (gemini + passthrough providers)
+ */
+export const PER_MODEL_QUOTA_PROVIDERS = new Set([
+  "antigravity",
+  "gemini",
+  "openrouter",
+]);
+
+/**
+ * Returns true if the provider uses per-model independent quotas.
+ * For these providers, a 429/404 on one model should only lock that model,
+ * not the whole connection (testStatus/backoffLevel stay untouched).
+ * @param {string|null} provider
+ * @returns {boolean}
+ */
+export function hasPerModelQuota(provider) {
+  if (!provider) return false;
+  return PER_MODEL_QUOTA_PROVIDERS.has(provider);
 }
 
 /**

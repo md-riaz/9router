@@ -192,8 +192,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
     console.log(`${COLORS.red}[ERROR] ${errMsg}${COLORS.reset}`);
-    if (retryAfterMs && provider === "antigravity") {
-      log?.debug?.("RETRY", `Antigravity quota reset in ${Math.ceil(retryAfterMs / 1000)}s`);
+    if (retryAfterMs) {
+      log?.debug?.("RETRY", `${provider.toUpperCase()} quota reset in ${Math.ceil(retryAfterMs / 1000)}s`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
     return createErrorResult(statusCode, errMsg, retryAfterMs);

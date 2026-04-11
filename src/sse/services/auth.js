@@ -1,8 +1,60 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, hasPerModelQuota } from "open-sse/services/accountFallback.js";
+import { getCodexModelScope } from "open-sse/executors/codex.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
+
+// ─── Codex scope-level lock helpers ──────────────────────────────────────────
+// Codex has two independent quota pools: "codex" and "spark".
+// Scope locks are stored in providerSpecificData.codexScopeRateLimitedUntil
+// so that exhausting one pool does not block the other.
+
+/**
+ * Get the scope-level rate-limit expiry for a specific Codex model.
+ * @param {object} providerSpecificData
+ * @param {string|null} model
+ * @returns {string|null} ISO expiry, or null
+ */
+function getCodexScopeRateLimitedUntil(providerSpecificData, model) {
+  if (!model || !providerSpecificData) return null;
+  const scope = getCodexModelScope(model);
+  const scopeMap = providerSpecificData.codexScopeRateLimitedUntil;
+  if (!scopeMap || typeof scopeMap !== "object") return null;
+  return scopeMap[scope] || null;
+}
+
+/**
+ * Returns true if this connection's Codex quota scope is still locked for the given model.
+ * @param {object} connection - raw connection record (has providerSpecificData)
+ * @param {string|null} model
+ * @returns {boolean}
+ */
+function isCodexScopeUnavailable(connection, model) {
+  const until = getCodexScopeRateLimitedUntil(connection.providerSpecificData, model);
+  if (!until) return false;
+  return new Date(until).getTime() > Date.now();
+}
+
+/**
+ * Earliest active Codex scope expiry across a set of connections for a given model.
+ * @param {Array} connections
+ * @param {string|null} model
+ * @returns {string|null} ISO expiry, or null
+ */
+function getEarliestCodexScopeRateLimitedUntil(connections, model) {
+  let earliest = null;
+  const now = Date.now();
+  for (const conn of connections) {
+    const until = getCodexScopeRateLimitedUntil(conn.providerSpecificData, model);
+    if (!until) continue;
+    const ms = new Date(until).getTime();
+    if (ms <= now) continue;
+    if (!earliest || ms < new Date(earliest).getTime()) earliest = until;
+  }
+  return earliest;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
@@ -47,6 +99,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      // For Codex: also skip connections whose scope quota pool is exhausted
+      if (provider === "codex" && isCodexScopeUnavailable(c, model)) return false;
       return true;
     });
 
@@ -54,16 +108,25 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     connections.forEach(c => {
       const excluded = excludeSet.has(c.id);
       const locked = isModelLockActive(c, model);
-      if (excluded || locked) {
-        const lockUntil = getEarliestModelLockUntil(c);
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
+      const scopeLocked = provider === "codex" && isCodexScopeUnavailable(c, model);
+      if (excluded || locked || scopeLocked) {
+        const lockUntil = getEarliestModelLockUntil(c) ||
+          (scopeLocked ? getCodexScopeRateLimitedUntil(c.providerSpecificData, model) : null);
+        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""} ${scopeLocked ? `codexScopeLocked(${getCodexModelScope(model)}) until ${lockUntil}` : ""}`);
       }
     });
 
     if (availableConnections.length === 0) {
-      // Find earliest lock expiry across all connections for retry timing
-      const lockedConns = connections.filter(c => isModelLockActive(c, model));
-      const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
+      // Find earliest lock expiry across all connections for retry timing.
+      // For Codex: also consider scope-level quota lock expiry.
+      const lockedConns = connections.filter(c => isModelLockActive(c, model) || (provider === "codex" && isCodexScopeUnavailable(c, model)));
+      const expiries = lockedConns.map(c => {
+        const modelExpiry = getEarliestModelLockUntil(c);
+        const scopeExpiry = provider === "codex" ? getCodexScopeRateLimitedUntil(c.providerSpecificData, model) : null;
+        // Return the earlier of the two (shortest wait)
+        if (modelExpiry && scopeExpiry) return modelExpiry < scopeExpiry ? modelExpiry : scopeExpiry;
+        return modelExpiry || scopeExpiry;
+      }).filter(Boolean);
       const earliest = expiries.sort()[0] || null;
       if (earliest) {
         const earliestConn = lockedConns[0];
@@ -166,9 +229,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
+ * @param {number|null} [retryAfterMs] - Provider-specified ms until reset (from Retry-After header etc.)
+ *   When provided and exceeds the computed backoff, the lock is set to this exact duration so the
+ *   account+model is not retried before the provider's actual quota window expires.
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, retryAfterMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
@@ -178,7 +244,78 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(model, cooldownMs);
+  const effectiveLockMs = (retryAfterMs != null && retryAfterMs > cooldownMs) ? retryAfterMs : cooldownMs;
+
+  // ── Per-model quota providers: antigravity, gemini, openrouter ─────────────
+  // These providers have independent quotas per model. A 429/404 on one model
+  // must NOT mark the connection unavailable or increment the backoff level —
+  // other models on the same account may still have quota available.
+  // Connection testStatus/backoffLevel are intentionally left untouched.
+  if (hasPerModelQuota(provider) && model && (status === 429 || status === 404)) {
+    // Use backoffLevel=0: each model's quota is independent; no cross-model backoff.
+    const { cooldownMs: modelCooldownMs } = checkFallbackError(status, errorText, 0);
+    const modelEffectiveLockMs = (retryAfterMs != null && retryAfterMs > modelCooldownMs) ? retryAfterMs : modelCooldownMs;
+    const lockUpdate = buildModelLockUpdate(model, modelCooldownMs, retryAfterMs);
+    const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
+
+    await updateProviderConnection(connectionId, {
+      ...lockUpdate,
+      // Only update observability fields — connection stays active for other models
+      lastError: reason,
+      errorCode: status,
+      lastErrorAt: new Date().toISOString(),
+    });
+
+    const lockKey = Object.keys(lockUpdate)[0];
+    log.info("AUTH", `${connName} model-only lock ${lockKey} for ${Math.round(modelEffectiveLockMs / 1000)}s [${status}] — connection stays active for other models${retryAfterMs && retryAfterMs > modelCooldownMs ? " (provider reset time)" : ""}`);
+
+    if (provider && status && reason) {
+      console.error(`❌ ${provider} [${status}] (model-only): ${reason}`);
+    }
+
+    return { shouldFallback: true, cooldownMs: modelEffectiveLockMs };
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // T09: Codex per-scope lockout (5h session + weekly quota pools are independent).
+  // When a Codex account hits a 429, we lock the ENTIRE quota scope (all models that
+  // share the same 5h/weekly pool) rather than just the single model variant.
+  // This prevents combo packs from wastefully cycling through gpt-5.3-codex-high,
+  // gpt-5.3-codex-low, gpt-5.1-codex, etc. when the shared pool is exhausted.
+  if (provider === "codex" && status === 429 && model && conn) {
+    const scope = getCodexModelScope(model);
+    const existingScopeMap = (conn.providerSpecificData?.codexScopeRateLimitedUntil) || {};
+    const newExpiry = new Date(Date.now() + effectiveLockMs).toISOString();
+    const existingExpiry = existingScopeMap[scope];
+
+    // Only update if the new expiry is further out (preserve longer locks)
+    if (!existingExpiry || new Date(newExpiry) > new Date(existingExpiry)) {
+      const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
+      await updateProviderConnection(connectionId, {
+        testStatus: "unavailable",
+        lastError: reason,
+        errorCode: status,
+        lastErrorAt: new Date().toISOString(),
+        backoffLevel: newBackoffLevel ?? backoffLevel,
+        providerSpecificData: {
+          ...(conn.providerSpecificData || {}),
+          codexScopeRateLimitedUntil: {
+            ...existingScopeMap,
+            [scope]: newExpiry,
+          },
+        },
+      });
+      log.warn("AUTH", `${connName} Codex scope [${scope}] locked until ${newExpiry} (${Math.round(effectiveLockMs / 1000)}s) [${status}]${retryAfterMs && retryAfterMs > cooldownMs ? " (provider reset time)" : ""}`);
+    }
+
+    if (provider && status && reason) {
+      console.error(`❌ ${provider} [${status}] (${scope}): ${reason}`);
+    }
+
+    return { shouldFallback: true, cooldownMs: effectiveLockMs };
+  }
+
+  const lockUpdate = buildModelLockUpdate(model, cooldownMs, retryAfterMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -191,7 +328,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
-  log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
+  log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(effectiveLockMs / 1000)}s [${status}]${retryAfterMs && retryAfterMs > cooldownMs ? " (provider reset time)" : ""}`);
 
   if (provider && status && reason) {
     console.error(`❌ ${provider} [${status}]: ${reason}`);
